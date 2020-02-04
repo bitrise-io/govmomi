@@ -147,6 +147,7 @@ load test_helper
 
   run govc -h
   assert_success
+  assert_matches "Usage of govc:"
 
   run govc -enoent
   assert_failure
@@ -159,4 +160,32 @@ load test_helper
 
   run govc vm.create -enoent
   assert_failure
+
+  run govc nope
+  assert_failure
+  assert_matches "Usage of govc:"
+
+  run govc power
+  assert_failure
+  assert_matches "did you mean:"
+}
+
+@test "govc format error" {
+  vcsim_env
+
+  vm=DC0_H0_VM0
+
+  run govc vm.power -json -on $vm
+  assert_failure
+  jq . <<<"$output"
+
+  run govc vm.power -xml -on $vm
+  assert_failure
+  if type xmlstarlet ; then
+    xmlstarlet fo <<<"$output"
+  fi
+
+  run govc vm.power -dump -on $vm
+  assert_failure
+  gofmt <<<"$output"
 }

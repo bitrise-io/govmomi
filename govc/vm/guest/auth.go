@@ -28,6 +28,7 @@ import (
 
 type AuthFlag struct {
 	auth types.NamePasswordAuthentication
+	proc bool
 }
 
 func newAuthFlag(ctx context.Context) (*AuthFlag, context.Context) {
@@ -59,6 +60,9 @@ func (flag *AuthFlag) Register(ctx context.Context, f *flag.FlagSet) {
 	}
 	usage := fmt.Sprintf("Guest VM credentials [%s]", env)
 	f.Var(flag, "l", usage)
+	if flag.proc {
+		f.BoolVar(&flag.auth.GuestAuthentication.InteractiveSession, "i", false, "Interactive session")
+	}
 }
 
 func (flag *AuthFlag) Process(ctx context.Context) error {

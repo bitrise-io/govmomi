@@ -19,13 +19,14 @@ package mo
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
 	"github.com/vmware/govmomi/vim25/xml"
 )
 
-func load(name string) *types.RetrievePropertiesResponse {
+func load(name string) []types.ObjectContent {
 	f, err := os.Open(name)
 	if err != nil {
 		panic(err)
@@ -41,13 +42,13 @@ func load(name string) *types.RetrievePropertiesResponse {
 		panic(err)
 	}
 
-	return &b
+	return b.Returnval
 }
 
 func TestNotAuthenticatedFault(t *testing.T) {
 	var s SessionManager
 
-	err := LoadRetrievePropertiesResponse(load("fixtures/not_authenticated_fault.xml"), &s)
+	err := LoadObjectContent(load("fixtures/not_authenticated_fault.xml"), &s)
 	if !soap.IsVimFault(err) {
 		t.Errorf("Expected IsVimFault")
 	}
@@ -61,7 +62,7 @@ func TestNotAuthenticatedFault(t *testing.T) {
 func TestNestedProperty(t *testing.T) {
 	var vm VirtualMachine
 
-	err := LoadRetrievePropertiesResponse(load("fixtures/nested_property.xml"), &vm)
+	err := LoadObjectContent(load("fixtures/nested_property.xml"), &vm)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %s", err)
 	}
@@ -91,7 +92,7 @@ func TestNestedProperty(t *testing.T) {
 func TestPointerProperty(t *testing.T) {
 	var vm VirtualMachine
 
-	err := LoadRetrievePropertiesResponse(load("fixtures/pointer_property.xml"), &vm)
+	err := LoadObjectContent(load("fixtures/pointer_property.xml"), &vm)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %s", err)
 	}
@@ -110,7 +111,7 @@ func TestEmbeddedTypeProperty(t *testing.T) {
 	// panic: reflect.Set: value of type mo.ClusterComputeResource is not assignable to type mo.ComputeResource
 	var cr ComputeResource
 
-	err := LoadRetrievePropertiesResponse(load("fixtures/cluster_host_property.xml"), &cr)
+	err := LoadObjectContent(load("fixtures/cluster_host_property.xml"), &cr)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %s", err)
 	}
@@ -123,7 +124,7 @@ func TestEmbeddedTypeProperty(t *testing.T) {
 func TestEmbeddedTypePropertySlice(t *testing.T) {
 	var me []ManagedEntity
 
-	err := LoadRetrievePropertiesResponse(load("fixtures/hostsystem_list_name_property.xml"), &me)
+	err := LoadObjectContent(load("fixtures/hostsystem_list_name_property.xml"), &me)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %s", err)
 	}
@@ -140,5 +141,73 @@ func TestEmbeddedTypePropertySlice(t *testing.T) {
 
 	if me[0].Name == me[1].Name {
 		t.Fatal("Name fields should not be the same")
+	}
+}
+
+func TestReferences(t *testing.T) {
+	var cr ComputeResource
+
+	err := LoadObjectContent(load("fixtures/cluster_host_property.xml"), &cr)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %s", err)
+	}
+
+	refs := References(cr)
+	n := len(refs)
+	if n != 5 {
+		t.Errorf("%d refs", n)
+	}
+}
+
+func TestEventReferences(t *testing.T) {
+	event := &types.VmPoweredOnEvent{
+		VmEvent: types.VmEvent{
+			Event: types.Event{
+				Key:         0,
+				ChainId:     0,
+				CreatedTime: time.Now(),
+				UserName:    "",
+				Datacenter: &types.DatacenterEventArgument{
+					EntityEventArgument: types.EntityEventArgument{
+						EventArgument: types.EventArgument{},
+						Name:          "DC0",
+					},
+					Datacenter: types.ManagedObjectReference{Type: "Datacenter", Value: "datacenter-2"},
+				},
+				ComputeResource: &types.ComputeResourceEventArgument{
+					EntityEventArgument: types.EntityEventArgument{
+						EventArgument: types.EventArgument{},
+						Name:          "DC0_C0",
+					},
+					ComputeResource: types.ManagedObjectReference{Type: "ClusterComputeResource", Value: "clustercomputeresource-26"},
+				},
+				Host: &types.HostEventArgument{
+					EntityEventArgument: types.EntityEventArgument{
+						EventArgument: types.EventArgument{},
+						Name:          "DC0_C0_H0",
+					},
+					Host: types.ManagedObjectReference{Type: "HostSystem", Value: "host-32"},
+				},
+				Vm: &types.VmEventArgument{
+					EntityEventArgument: types.EntityEventArgument{
+						EventArgument: types.EventArgument{},
+						Name:          "DC0_C0_RP0_VM1",
+					},
+					Vm: types.ManagedObjectReference{Type: "VirtualMachine", Value: "vm-62"},
+				},
+				Ds:                   (*types.DatastoreEventArgument)(nil),
+				Net:                  (*types.NetworkEventArgument)(nil),
+				Dvs:                  (*types.DvsEventArgument)(nil),
+				FullFormattedMessage: "",
+				ChangeTag:            "",
+			},
+			Template: false,
+		},
+	}
+
+	refs := References(event, true)
+	n := len(refs)
+	if n != 4 {
+		t.Errorf("%d refs", n)
 	}
 }

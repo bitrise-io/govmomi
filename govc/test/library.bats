@@ -136,6 +136,16 @@ load test_helper
   run govc library.import -n ttylinux-live /my-content "$GOVC_IMAGES/$TTYLINUX_NAME.iso"
   assert_success
 
+  run govc library.info -l "/my-content/ttylinux-live/$TTYLINUX_NAME.iso"
+  assert_success
+
+  run govc library.info -L /my-content/ttylinux-live/
+  assert_success
+  assert_matches contentlib-
+  file="$output"
+  run govc datastore.ls "$file"
+  assert_matches "$TTYLINUX_NAME.iso"
+
   run govc library.ls "/my-content/ttylinux-live/*"
   assert_success
   assert_matches "$TTYLINUX_NAME.iso"
@@ -209,7 +219,10 @@ EOF
   assert_success
   assert_matches DC0_DVPG0
 
-  run govc vm.destroy ttylinux ttylinux2
+  run env GOVC_DATASTORE="" govc library.deploy "my-content/$TTYLINUX_NAME" ttylinux3 # datastore is not required
+  assert_success
+
+  run govc vm.destroy ttylinux ttylinux2 ttylinux3
   assert_success
 
   item_id=$(govc library.info -json "/my-content/$TTYLINUX_NAME" | jq -r .[].id)
@@ -219,4 +232,128 @@ EOF
 
   run govc library.deploy "my-content/$TTYLINUX_NAME" ttylinux2
   assert_failure
+}
+
+@test "library.clone ovf" {
+  vcsim_env
+
+  vm=DC0_H0_VM0
+  item="${vm}_item"
+
+  run govc library.create my-content
+  assert_success
+
+  run govc library.clone -vm $vm -ovf my-content $item
+  assert_success
+
+  run govc vm.destroy $vm
+  assert_success
+
+  run govc library.ls my-content/
+  assert_success /my-content/$item
+}
+
+@test "library.deploy vmtx" {
+  vcsim_env
+
+  vm=DC0_H0_VM0
+  item="${vm}_item"
+
+  run govc vm.clone -library enoent -vm $vm $item
+  assert_failure # library does not exist
+
+  run govc library.create my-content
+  assert_success
+
+  run govc library.deploy my-content/$item my-vm
+  assert_failure # vmtx item does not exist
+
+  run govc library.clone -vm $vm my-content $item
+  assert_success
+
+  run govc library.deploy my-content/$item my-vm
+  assert_success
+
+  export GOVC_SHOW_UNRELEASED=true
+  run govc library.checkout my-content/enoent my-vm-checkout
+  assert_failure # vmtx item does not exist
+
+  run govc library.checkout my-content/$item my-vm-checkout
+  assert_success
+
+  run govc library.checkin -vm my-vm-checkout my-content/enoent
+  assert_failure # vmtx item does not exist
+
+  run govc library.checkin -vm my-vm-checkout my-content/$item
+  assert_success
+
+  run govc object.collect -s vm/$item config.template
+  assert_success "true"
+
+  run govc object.collect -s vm/$item summary.config.template
+  assert_success "true"
+
+  run govc vm.destroy $item
+  assert_success # expected to delete the CL item too
+
+  run govc library.deploy my-content/$item my-vm2
+  assert_failure # $item no longer exists
+}
+
+@test "library.pubsub" {
+  vcsim_env
+
+  url="https://$(govc env GOVC_URL)/TODO"
+
+  run govc library.create -sub "$url" my-content
+  assert_success
+
+  run govc library.info my-content
+  assert_success
+  assert_matches "Subscription:"
+  assert_matches "$url"
+
+  run govc library.import my-content "$GOVC_IMAGES/ttylinux-latest.ova"
+  assert_success # TODO: this should fail, but allow until vcsim supports publishing
+
+  run govc library.sync my-content
+  assert_success
+
+  run govc library.create my-content-vmtx
+  assert_success
+
+  run govc library.sync -vmtx my-content-vmtx my-content
+  assert_success
+}
+
+@test "library.findbyid" {
+  vcsim_env
+
+  run govc library.create my-content
+  assert_success
+  id="$output"
+
+  run govc library.create my-content
+  assert_success
+
+  run govc library.import my-content library.bats
+  assert_failure # "my-content" matches 2 items
+
+  run govc library.import "$id" library.bats
+  assert_success # using id to find library
+
+  n=$(govc library.info my-content | grep -c Name:)
+  [ "$n" == 2 ]
+
+  n=$(govc library.info "$id" | grep -c Name:)
+  [ "$n" == 1 ]
+
+  run govc library.rm my-content
+  assert_failure # "my-content" matches 2 items
+
+  run govc library.rm "$id"
+  assert_success
+
+  n=$(govc library.info my-content | grep -c Name:)
+  [ "$n" == 1 ]
 }

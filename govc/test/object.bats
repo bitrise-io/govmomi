@@ -27,7 +27,7 @@ load test_helper
 }
 
 @test "object.rename" {
-  esx_env
+  vcsim_env
 
   run govc object.rename "/enoent" "nope"
   assert_failure
@@ -77,7 +77,7 @@ load test_helper
 }
 
 @test "object.collect" {
-  esx_env
+  vcsim_env
 
   run govc object.collect
   assert_success
@@ -124,13 +124,21 @@ load test_helper
   assert_success
 
   # test against slice of interface
-  perfman=$(govc object.collect -s - content.perfManager)
-  result=$(govc object.collect -s "$perfman" description.counterType)
+  setting=$(govc object.collect -s - content.setting)
+  result=$(govc object.collect -s "$setting" setting)
   assert_equal "..." "$result"
 
   # test against an interface field
-  run govc object.collect '/ha-datacenter/network/VM Network' summary
+  run govc object.collect 'network/VM Network' summary
   assert_success
+
+  run govc object.collect -dump -o 'network/VM Network'
+  assert_success
+  gofmt <<<"$output"
+
+  run govc object.collect -json -o 'network/VM Network'
+  assert_success
+  jq . <<<"$output"
 }
 
 @test "object.collect vcsim" {
@@ -497,6 +505,12 @@ EOF
   unset GOVC_DATACENTER
   run govc find vm
   assert_failure # without Datacenter specified, there are 0 "vm" folders relative to the root folder
+
+  run govc find -l /
+  assert_success
+
+  run govc find -l -i /
+  assert_success
 }
 
 @test "object.method" {
@@ -524,4 +538,16 @@ EOF
 
   run govc object.collect -s "$vm" disabledMethod
   ! assert_matches "Destroy_Task" "$output"
+}
+
+@test "object.save" {
+  vcsim_env
+
+  dir="$BATS_TMPDIR/$(new_id)"
+  run govc object.save -v -d "$dir" /DC0/vm
+  assert_success
+
+  n=$(ls "$dir"/*.xml | wc -l)
+  rm -rf "$dir"
+  assert_equal 6 "$n"
 }

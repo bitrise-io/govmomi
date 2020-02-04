@@ -29,6 +29,7 @@ import (
 	"github.com/vmware/govmomi/vapi/library/finder"
 	"github.com/vmware/govmomi/vapi/rest"
 	"github.com/vmware/govmomi/vapi/vcenter"
+	"github.com/vmware/govmomi/vim25/types"
 )
 
 type deploy struct {
@@ -37,6 +38,8 @@ type deploy struct {
 	*flags.HostSystemFlag
 	*flags.FolderFlag
 	*importx.OptionsFlag
+
+	profile string
 }
 
 func init() {
@@ -58,6 +61,8 @@ func (cmd *deploy) Register(ctx context.Context, f *flag.FlagSet) {
 
 	cmd.OptionsFlag = new(importx.OptionsFlag)
 	cmd.OptionsFlag.Register(ctx, f)
+
+	f.StringVar(&cmd.profile, "profile", "", "Storage profile")
 }
 
 func (cmd *deploy) Process(ctx context.Context) error {
@@ -104,14 +109,14 @@ func (cmd *deploy) Run(ctx context.Context, f *flag.FlagSet) error {
 			return err
 		}
 		if len(res) != 1 {
-			return fmt.Errorf("%q matches %d items", path, len(res))
+			return ErrMultiMatch{Type: "library", Key: "name", Val: f.Arg(0), Count: len(res)}
 		}
 		item, ok := res[0].GetResult().(library.Item)
 		if !ok {
 			return fmt.Errorf("%q is a %T", path, item)
 		}
 
-		ds, err := cmd.Datastore()
+		ds, err := cmd.DatastoreIfSpecified()
 		if err != nil {
 			return err
 		}
@@ -159,34 +164,87 @@ func (cmd *deploy) Run(ctx context.Context, f *flag.FlagSet) error {
 			})
 		}
 
-		deploy := vcenter.Deploy{
-			DeploymentSpec: vcenter.DeploymentSpec{
-				Name:               name,
-				DefaultDatastoreID: ds.Reference().Value,
-				AcceptAllEULA:      true,
-				Annotation:         cmd.Options.Annotation,
-				AdditionalParams: []vcenter.AdditionalParams{
-					{
-						Class:       vcenter.ClassOvfParams,
-						Type:        vcenter.TypeDeploymentOptionParams,
-						SelectedKey: cmd.Options.Deployment,
-					},
-				},
-				NetworkMappings:     networks,
-				StorageProvisioning: cmd.Options.DiskProvisioning,
-			},
-			Target: vcenter.Target{
-				ResourcePoolID: rp.Reference().Value,
-				HostID:         hostID,
-				FolderID:       folder.Reference().Value,
-			},
+		var properties []vcenter.Property
+		for _, prop := range cmd.Options.PropertyMapping {
+			properties = append(properties, vcenter.Property{
+				ID:    prop.Key,
+				Value: prop.Value,
+			})
+		}
+
+		dsID := ""
+		if ds != nil {
+			dsID = ds.Reference().Value
 		}
 
 		cmd.FolderFlag.Log("Deploying library item...\n")
 
-		ref, err := m.DeployLibraryItem(ctx, item.ID, deploy)
-		if err != nil {
-			return err
+		var ref *types.ManagedObjectReference
+
+		switch item.Type {
+		case library.ItemTypeOVF:
+			deploy := vcenter.Deploy{
+				DeploymentSpec: vcenter.DeploymentSpec{
+					Name:               name,
+					DefaultDatastoreID: dsID,
+					AcceptAllEULA:      true,
+					Annotation:         cmd.Options.Annotation,
+					AdditionalParams: []vcenter.AdditionalParams{
+						{
+							Class:       vcenter.ClassOvfParams,
+							Type:        vcenter.TypeDeploymentOptionParams,
+							SelectedKey: cmd.Options.Deployment,
+						},
+						{
+							Class:       vcenter.ClassPropertyParams,
+							Type:        vcenter.TypePropertyParams,
+							SelectedKey: cmd.Options.Deployment,
+							Properties:  properties,
+						},
+					},
+					NetworkMappings:     networks,
+					StorageProvisioning: cmd.Options.DiskProvisioning,
+					StorageProfileID:    cmd.profile,
+				},
+				Target: vcenter.Target{
+					ResourcePoolID: rp.Reference().Value,
+					HostID:         hostID,
+					FolderID:       folder.Reference().Value,
+				},
+			}
+			ref, err = m.DeployLibraryItem(ctx, item.ID, deploy)
+			if err != nil {
+				return err
+			}
+		case library.ItemTypeVMTX:
+			storage := &vcenter.DiskStorage{
+				Datastore: dsID,
+				StoragePolicy: &vcenter.StoragePolicy{
+					Policy: cmd.profile,
+					Type:   "USE_SOURCE_POLICY",
+				},
+			}
+			if cmd.profile != "" {
+				storage.StoragePolicy.Type = "USE_SPECIFIED_POLICY"
+			}
+
+			deploy := vcenter.DeployTemplate{
+				Name:          name,
+				Description:   cmd.Options.Annotation,
+				DiskStorage:   storage,
+				VMHomeStorage: storage,
+				Placement: &vcenter.Placement{
+					ResourcePool: rp.Reference().Value,
+					Host:         hostID,
+					Folder:       folder.Reference().Value,
+				},
+			}
+			ref, err = m.DeployTemplateLibraryItem(ctx, item.ID, deploy)
+			if err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported library item type: %s", item.Type)
 		}
 
 		obj, err := finder.ObjectReference(ctx, *ref)

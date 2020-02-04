@@ -93,6 +93,9 @@ load test_helper
   run govc object.collect -s $vm guest.ipAddress
   assert_success "10.0.0.1"
 
+  run govc vm.ip $vm
+  assert_success "10.0.0.1"
+
   run govc object.collect -s $vm summary.guest.ipAddress
   assert_success "10.0.0.1"
 
@@ -168,18 +171,23 @@ load test_helper
   wait $pid
 }
 
+docker_name() {
+  echo "vcsim-$1-$(govc object.collect -s "vm/$1" config.uuid)"
+}
+
 @test "vcsim run container" {
   if ! docker version ; then
     skip "docker client not installed"
   fi
 
-  vm=DC0_H0_VM0
+  vcsim_env -autostart=false
 
-  if docker inspect $vm ; then
+  vm=DC0_H0_VM0
+  name=$(docker_name $vm)
+
+  if docker inspect "$name" ; then
     flunk "$vm container still exists"
   fi
-
-  vcsim_env -autostart=false
 
   run govc vm.change -vm $vm -e RUN.container=nginx
   assert_success
@@ -187,11 +195,11 @@ load test_helper
   run govc vm.power -on $vm
   assert_success
 
-  if ! docker inspect $vm ; then
+  if ! docker inspect "$name" ; then
     flunk "$vm container does not exist"
   fi
 
-  ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $vm)
+  ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$name")
   run govc object.collect -s vm/$vm guest.ipAddress
   assert_success "$ip"
 
@@ -204,32 +212,37 @@ load test_helper
   run govc vm.power -s $vm
   assert_success
 
-  run docker inspect -f '{{.State.Status}}' $vm
+  run docker inspect -f '{{.State.Status}}' "$name"
   assert_success "exited"
 
   run govc vm.power -on $vm
   assert_success
 
-  run docker inspect -f '{{.State.Status}}' $vm
+  run docker inspect -f '{{.State.Status}}' "$name"
   assert_success "running"
 
   run govc vm.destroy $vm
   assert_success
 
-  if docker inspect $vm ; then
+  if docker inspect "$name" ; then
     flunk "$vm container still exists"
   fi
 
   vm=DC0_H0_VM1
+  name=$(docker_name $vm)
 
   # test json encoded args
   run govc vm.change -vm $vm -e RUN.container="[\"-v\", \"$PWD:/usr/share/nginx/html:ro\", \"nginx\"]"
   assert_success
 
+  # test bash -c args parsing
+  run govc vm.change -vm $vm -e RUN.container="-v '$PWD:/usr/share/nginx/html:ro' nginx"
+  assert_success
+
   run govc vm.power -on $vm
   assert_success
 
-  run docker inspect $vm
+  run docker inspect "$name"
   assert_success
 
   ip=$(govc object.collect -s vm/$vm guest.ipAddress)
@@ -237,23 +250,65 @@ load test_helper
   assert_success
 
   # test suspend/resume
-  run docker inspect -f '{{.State.Status}}' $vm
+  run docker inspect -f '{{.State.Status}}' "$name"
   assert_success "running"
 
   run govc vm.power -suspend $vm
   assert_success
 
-  run docker inspect -f '{{.State.Status}}' $vm
+  run docker inspect -f '{{.State.Status}}' "$name"
   assert_success "paused"
 
   run govc vm.power -on $vm
   assert_success
 
-  run docker inspect -f '{{.State.Status}}' $vm
+  run docker inspect -f '{{.State.Status}}' "$name"
   assert_success "running"
+
+  run docker volume inspect "$name"
+  assert_success
 
   run govc vm.destroy $vm
   assert_success
+
+  run docker volume inspect "$name"
+  assert_failure
+
+  vm=DC0_C0_RP0_VM0
+  name=$(docker_name $vm)
+
+  run govc vm.change -vm $vm -e RUN.container="busybox grep VMware- /sys/class/dmi/id/product_serial"
+  assert_success
+
+  run govc vm.power -on $vm
+  assert_success
+
+  run docker inspect -f '{{.State.ExitCode}}' "$name"
+  assert_success "0"
+
+  run govc vm.destroy $vm
+  assert_success
+
+  vm=DC0_C0_RP0_VM1
+  name=$(docker_name $vm)
+
+  run govc vm.change -vm $vm -e RUN.container="busybox sh -c 'sleep \$VMX_GUESTINFO_SLEEP'" -e guestinfo.sleep=500
+  assert_success
+
+  run govc vm.power -on $vm
+  assert_success
+
+  run docker inspect -f '{{.State.Status}}' "$name"
+  assert_success "running"
+
+  # stopping vcsim should remove the containers and volumes
+  vcsim_stop
+
+  run docker inspect "$name"
+  assert_failure
+
+  run docker volume inspect "$name"
+  assert_failure
 }
 
 @test "vcsim listen" {
@@ -349,4 +404,33 @@ load test_helper
 
   run govc vm.destroy "$TTYLINUX_NAME"
   assert_success
+}
+
+@test "vcsim model load" {
+  vcsim_start
+  dir="$BATS_TMPDIR/$(new_id)"
+  govc object.save -v -d "$dir"
+  vcsim_stop
+
+  vcsim_env -load "$dir"
+  rm -rf "$dir"
+
+  objs=$(govc find / | wc -l)
+  assert_equal 23 "$objs"
+}
+
+@test "vcsim trace file" {
+  file="$BATS_TMPDIR/$(new_id).trace"
+
+  vcsim_start -trace-file "$file"
+
+  run govc ls
+  assert_success
+
+  vcsim_stop
+
+  run ls -l "$file"
+  assert_success
+
+  rm "$file"
 }

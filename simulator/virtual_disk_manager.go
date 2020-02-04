@@ -17,11 +17,11 @@ limitations under the License.
 package simulator
 
 import (
+	"fmt"
 	"os"
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
@@ -30,12 +30,6 @@ import (
 
 type VirtualDiskManager struct {
 	mo.VirtualDiskManager
-}
-
-func NewVirtualDiskManager(ref types.ManagedObjectReference) object.Reference {
-	m := &VirtualDiskManager{}
-	m.Self = ref
-	return m
 }
 
 func (m *VirtualDiskManager) names(name string) []string {
@@ -85,7 +79,10 @@ func (m *VirtualDiskManager) createVirtualDisk(op types.VirtualDeviceConfigSpecF
 
 func (m *VirtualDiskManager) CreateVirtualDiskTask(req *types.CreateVirtualDisk_Task) soap.HasFault {
 	task := CreateTask(m, "createVirtualDisk", func(*Task) (types.AnyType, types.BaseMethodFault) {
-		return nil, m.createVirtualDisk(types.VirtualDeviceConfigSpecFileOperationCreate, req)
+		if err := m.createVirtualDisk(types.VirtualDeviceConfigSpecFileOperationCreate, req); err != nil {
+			return "", err
+		}
+		return req.Name, nil
 	})
 
 	return &methods.CreateVirtualDisk_TaskBody{
@@ -199,8 +196,8 @@ func (m *VirtualDiskManager) QueryVirtualDiskUuid(req *types.QueryVirtualDiskUui
 
 	_, err := os.Stat(file)
 	if err != nil {
-		fault = fm.fault(file, err, new(types.CannotAccessFile))
-		body.Fault_ = Fault("", fault)
+		fault = fm.fault(req.Name, err, new(types.CannotAccessFile))
+		body.Fault_ = Fault(fmt.Sprintf("File %s was not found", req.Name), fault)
 		return body
 	}
 

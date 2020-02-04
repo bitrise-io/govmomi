@@ -17,11 +17,13 @@ limitations under the License.
 package simulator
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"path"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/mo"
@@ -63,7 +65,10 @@ func (f *Folder) update(o mo.Reference, u func(mo.Reference, *[]types.ManagedObj
 	}
 }
 
-func networkSummary(n *mo.Network) *types.NetworkSummary {
+func networkSummary(n *mo.Network) types.BaseNetworkSummary {
+	if n.Summary != nil {
+		return n.Summary
+	}
 	return &types.NetworkSummary{
 		Network:    &n.Self,
 		Name:       n.Name,
@@ -109,6 +114,38 @@ func (f *Folder) typeNotSupported() *soap.Fault {
 	return Fault(fmt.Sprintf("%s supports types: %#v", f.Self, f.ChildType), &types.NotSupported{})
 }
 
+// AddOpaqueNetwork adds an OpaqueNetwork type to the inventory, with default backing to that of an nsx.LogicalSwitch.
+// The vSphere API does not have a method to add this directly, so it must either be called directly or via Model.OpaqueNetwork setting.
+func (f *Folder) AddOpaqueNetwork(summary types.OpaqueNetworkSummary) error {
+	if !f.hasChildType("Network") {
+		return errors.New("not a network folder")
+	}
+
+	if summary.OpaqueNetworkId == "" {
+		summary.OpaqueNetworkId = uuid.New().String()
+	}
+	if summary.OpaqueNetworkType == "" {
+		summary.OpaqueNetworkType = "nsx.LogicalSwitch"
+	}
+	if summary.Name == "" {
+		summary.Name = summary.OpaqueNetworkType + "-" + summary.OpaqueNetworkId
+	}
+
+	net := new(mo.OpaqueNetwork)
+	if summary.Network == nil {
+		summary.Network = &net.Self
+	} else {
+		net.Self = *summary.Network
+	}
+	summary.Accessible = true
+	net.Network.Name = summary.Name
+	net.Summary = &summary
+
+	f.putChild(net)
+
+	return nil
+}
+
 type addStandaloneHost struct {
 	*Folder
 
@@ -146,6 +183,15 @@ func (f *Folder) CreateFolder(c *types.CreateFolder) soap.HasFault {
 	r := &methods.CreateFolderBody{}
 
 	if f.hasChildType("Folder") {
+		if obj := Map.FindByName(c.Name, f.ChildEntity); obj != nil {
+			r.Fault_ = Fault("", &types.DuplicateName{
+				Name:   c.Name,
+				Object: f.Self,
+			})
+
+			return r
+		}
+
 		folder := &Folder{}
 
 		folder.Name = c.Name
@@ -172,6 +218,15 @@ func (f *Folder) CreateStoragePod(c *types.CreateStoragePod) soap.HasFault {
 	r := &methods.CreateStoragePodBody{}
 
 	if f.hasChildType("StoragePod") {
+		if obj := Map.FindByName(c.Name, f.ChildEntity); obj != nil {
+			r.Fault_ = Fault("", &types.DuplicateName{
+				Name:   c.Name,
+				Object: f.Self,
+			})
+
+			return r
+		}
+
 		pod := &StoragePod{}
 
 		pod.Name = c.Name
@@ -445,8 +500,6 @@ func (c *registerVM) Run(task *Task) (types.AnyType, types.BaseMethodFault) {
 }
 
 func (f *Folder) RegisterVMTask(ctx *Context, c *types.RegisterVM_Task) soap.HasFault {
-	ctx.Caller = &f.Self
-
 	return &methods.RegisterVM_TaskBody{
 		Res: &types.RegisterVM_TaskResponse{
 			Returnval: NewTask(&registerVM{f, ctx, c}).Run(),

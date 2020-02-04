@@ -39,27 +39,25 @@ import (
 	"github.com/google/uuid"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/nfc"
+	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/ovf"
+	"github.com/vmware/govmomi/simulator"
 	"github.com/vmware/govmomi/vapi/internal"
 	"github.com/vmware/govmomi/vapi/library"
 	"github.com/vmware/govmomi/vapi/rest"
 	"github.com/vmware/govmomi/vapi/tags"
 	"github.com/vmware/govmomi/vapi/vcenter"
 	"github.com/vmware/govmomi/view"
+	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/types"
 	vim "github.com/vmware/govmomi/vim25/types"
 )
 
-type session struct {
-	User         string    `json:"user"`
-	Created      time.Time `json:"created_time"`
-	LastAccessed time.Time `json:"last_accessed_time"`
-}
-
 type item struct {
 	*library.Item
-	File []library.File
+	File     []library.File
+	Template *types.ManagedObjectReference
 }
 
 type content struct {
@@ -80,16 +78,25 @@ type download struct {
 }
 
 type handler struct {
-	*http.ServeMux
 	sync.Mutex
+	ServeMux    *http.ServeMux
 	URL         url.URL
 	Category    map[string]*tags.Category
 	Tag         map[string]*tags.Tag
 	Association map[string]map[internal.AssociatedObject]bool
-	Session     map[string]*session
+	Session     map[string]*rest.Session
 	Library     map[string]content
 	Update      map[string]update
 	Download    map[string]download
+}
+
+func init() {
+	simulator.RegisterEndpoint(func(s *simulator.Service, r *simulator.Registry) {
+		if r.IsVPX() {
+			path, handler := New(s.Listen, r.OptionManager().Setting)
+			s.Handle(path, handler)
+		}
+	})
 }
 
 // New creates a vAPI simulator.
@@ -100,7 +107,7 @@ func New(u *url.URL, settings []vim.BaseOptionValue) (string, http.Handler) {
 		Category:    make(map[string]*tags.Category),
 		Tag:         make(map[string]*tags.Tag),
 		Association: make(map[string]map[internal.AssociatedObject]bool),
-		Session:     make(map[string]*session),
+		Session:     make(map[string]*rest.Session),
 		Library:     make(map[string]content),
 		Update:      make(map[string]update),
 		Download:    make(map[string]download),
@@ -119,10 +126,13 @@ func New(u *url.URL, settings []vim.BaseOptionValue) (string, http.Handler) {
 		{internal.AssociationPath + "/", s.associationID},
 		{internal.LibraryPath, s.library},
 		{internal.LocalLibraryPath, s.library},
+		{internal.SubscribedLibraryPath, s.library},
 		{internal.LibraryPath + "/", s.libraryID},
 		{internal.LocalLibraryPath + "/", s.libraryID},
+		{internal.SubscribedLibraryPath + "/", s.libraryID},
 		{internal.LibraryItemPath, s.libraryItem},
 		{internal.LibraryItemPath + "/", s.libraryItemID},
+		{internal.SubscribedLibraryItem + "/", s.libraryItemID},
 		{internal.LibraryItemUpdateSession, s.libraryItemUpdateSession},
 		{internal.LibraryItemUpdateSession + "/", s.libraryItemUpdateSessionID},
 		{internal.LibraryItemUpdateSessionFile, s.libraryItemUpdateSessionFile},
@@ -134,25 +144,50 @@ func New(u *url.URL, settings []vim.BaseOptionValue) (string, http.Handler) {
 		{internal.LibraryItemFileData + "/", s.libraryItemFileData},
 		{internal.LibraryItemFilePath, s.libraryItemFile},
 		{internal.LibraryItemFilePath + "/", s.libraryItemFileID},
-		{internal.VCenterOVFLibraryItem + "/", s.libraryItemDeployID},
+		{internal.VCenterOVFLibraryItem, s.libraryItemOVF},
+		{internal.VCenterOVFLibraryItem + "/", s.libraryItemOVFID},
+		{internal.VCenterVMTXLibraryItem, s.libraryItemCreateTemplate},
+		{internal.VCenterVMTXLibraryItem + "/", s.libraryItemTemplateID},
+		{internal.VCenterVM + "/", s.vmID},
 	}
 
 	for i := range handlers {
 		h := handlers[i]
-		s.HandleFunc(internal.Path+h.p, func(w http.ResponseWriter, r *http.Request) {
-			s.Lock()
-			defer s.Unlock()
-
-			if !s.isAuthorized(r) {
-				w.WriteHeader(http.StatusUnauthorized)
-				return
-			}
-
-			h.m(w, r)
-		})
+		s.HandleFunc(h.p, h.m)
 	}
 
-	return internal.Path + "/", s
+	return rest.Path + "/", s
+}
+
+func (s *handler) withClient(f func(context.Context, *vim25.Client) error) error {
+	ctx := context.Background()
+	c, err := govmomi.NewClient(ctx, &s.URL, true)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = c.Logout(ctx)
+	}()
+	return f(ctx, c.Client)
+}
+
+// HandleFunc wraps the given handler with authorization checks and passes to http.ServeMux.HandleFunc
+func (s *handler) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
+	if !strings.HasPrefix(pattern, rest.Path) {
+		pattern = rest.Path + pattern
+	}
+
+	s.ServeMux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		s.Lock()
+		defer s.Unlock()
+
+		if !s.isAuthorized(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		handler(w, r)
+	})
 }
 
 func (s *handler) isAuthorized(r *http.Request) bool {
@@ -250,8 +285,8 @@ func (s *handler) DetachTag(id vim.ManagedObjectReference, tag vim.VslmTagEntry)
 	return nil
 }
 
-// ok responds with http.StatusOK and json encodes val if given.
-func (s *handler) ok(w http.ResponseWriter, val ...interface{}) {
+// OK responds with http.StatusOK and json encoded val if given.
+func OK(w http.ResponseWriter, val ...interface{}) {
 	w.WriteHeader(http.StatusOK)
 
 	if len(val) == 0 {
@@ -269,7 +304,8 @@ func (s *handler) ok(w http.ResponseWriter, val ...interface{}) {
 	}
 }
 
-func (s *handler) fail(w http.ResponseWriter, kind string) {
+// BadRequest responds with http.StatusBadRequest and json encoded vAPI error of type kind.
+func BadRequest(w http.ResponseWriter, kind string) {
 	w.WriteHeader(http.StatusBadRequest)
 
 	err := json.NewEncoder(w).Encode(struct {
@@ -300,11 +336,17 @@ func (s *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h, _ := s.Handler(r)
+	h, _ := s.ServeMux.Handler(r)
 	h.ServeHTTP(w, r)
 }
 
 func (s *handler) decode(r *http.Request, w http.ResponseWriter, val interface{}) bool {
+	return Decode(r, w, val)
+}
+
+// Decode the request Body into val.
+// Returns true on success, otherwise false and sends the http.StatusBadRequest response.
+func Decode(r *http.Request, w http.ResponseWriter, val interface{}) bool {
 	defer r.Body.Close()
 	err := json.NewDecoder(r.Body).Decode(val)
 	if err != nil {
@@ -321,8 +363,8 @@ func (s *handler) session(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		if s.action(r) != "" {
-			if _, ok := s.Session[id]; ok {
-				s.ok(w)
+			if session, ok := s.Session[id]; ok {
+				OK(w, session)
 			} else {
 				w.WriteHeader(http.StatusUnauthorized)
 			}
@@ -335,18 +377,18 @@ func (s *handler) session(w http.ResponseWriter, r *http.Request) {
 		}
 		id = uuid.New().String()
 		now := time.Now()
-		s.Session[id] = &session{user, now, now}
+		s.Session[id] = &rest.Session{User: user, Created: now, LastAccessed: now}
 		http.SetCookie(w, &http.Cookie{
 			Name:  internal.SessionCookieName,
 			Value: id,
-			Path:  internal.Path,
+			Path:  rest.Path,
 		})
-		s.ok(w, id)
+		OK(w, id)
 	case http.MethodDelete:
 		delete(s.Session, id)
-		s.ok(w)
+		OK(w)
 	case http.MethodGet:
-		s.ok(w, s.Session[id])
+		OK(w, s.Session[id])
 	}
 }
 
@@ -376,14 +418,14 @@ func (s *handler) category(w http.ResponseWriter, r *http.Request) {
 		if s.decode(r, w, &spec) {
 			for _, category := range s.Category {
 				if category.Name == spec.Category.Name {
-					s.fail(w, "com.vmware.vapi.std.errors.already_exists")
+					BadRequest(w, "com.vmware.vapi.std.errors.already_exists")
 					return
 				}
 			}
 			id := newID("Category")
 			spec.Category.ID = id
 			s.Category[id] = &spec.Category
-			s.ok(w, id)
+			OK(w, id)
 		}
 	case http.MethodGet:
 		var ids []string
@@ -391,7 +433,7 @@ func (s *handler) category(w http.ResponseWriter, r *http.Request) {
 			ids = append(ids, id)
 		}
 
-		s.ok(w, ids)
+		OK(w, ids)
 	}
 }
 
@@ -413,7 +455,7 @@ func (s *handler) categoryID(w http.ResponseWriter, r *http.Request) {
 				delete(s.Association, ix)
 			}
 		}
-		s.ok(w)
+		OK(w)
 	case http.MethodPatch:
 		var spec struct {
 			Category tags.Category `json:"update_spec"`
@@ -428,15 +470,15 @@ func (s *handler) categoryID(w http.ResponseWriter, r *http.Request) {
 					fail = !reflect.DeepEqual(o.AssociableTypes, spec.Category.AssociableTypes[:etypes])
 				}
 				if fail {
-					s.fail(w, "com.vmware.vapi.std.errors.invalid_argument")
+					BadRequest(w, "com.vmware.vapi.std.errors.invalid_argument")
 					return
 				}
 			}
 			o.Patch(&spec.Category)
-			s.ok(w)
+			OK(w)
 		}
 	case http.MethodGet:
-		s.ok(w, o)
+		OK(w, o)
 	}
 }
 
@@ -448,8 +490,8 @@ func (s *handler) tag(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.decode(r, w, &spec) {
 			for _, tag := range s.Tag {
-				if tag.Name == spec.Tag.Name {
-					s.fail(w, "com.vmware.vapi.std.errors.already_exists")
+				if tag.Name == spec.Tag.Name && tag.CategoryID == spec.Tag.CategoryID {
+					BadRequest(w, "com.vmware.vapi.std.errors.already_exists")
 					return
 				}
 			}
@@ -457,14 +499,14 @@ func (s *handler) tag(w http.ResponseWriter, r *http.Request) {
 			spec.Tag.ID = id
 			s.Tag[id] = &spec.Tag
 			s.Association[id] = make(map[internal.AssociatedObject]bool)
-			s.ok(w, id)
+			OK(w, id)
 		}
 	case http.MethodGet:
 		var ids []string
 		for id := range s.Tag {
 			ids = append(ids, id)
 		}
-		s.ok(w, ids)
+		OK(w, ids)
 	}
 }
 
@@ -479,7 +521,7 @@ func (s *handler) tagID(w http.ResponseWriter, r *http.Request) {
 				ids = append(ids, tag.ID)
 			}
 		}
-		s.ok(w, ids)
+		OK(w, ids)
 		return
 	}
 
@@ -494,17 +536,17 @@ func (s *handler) tagID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		delete(s.Tag, id)
 		delete(s.Association, id)
-		s.ok(w)
+		OK(w)
 	case http.MethodPatch:
 		var spec struct {
 			Tag tags.Tag `json:"update_spec"`
 		}
 		if s.decode(r, w, &spec) {
 			o.Patch(&spec.Tag)
-			s.ok(w)
+			OK(w)
 		}
 	case http.MethodGet:
-		s.ok(w, o)
+		OK(w, o)
 	}
 }
 
@@ -531,7 +573,7 @@ func (s *handler) association(w http.ResponseWriter, r *http.Request) {
 				ids = append(ids, id)
 			}
 		}
-		s.ok(w, ids)
+		OK(w, ids)
 	case "list-attached-objects-on-tags":
 		var res []tags.AttachedObjects
 		for _, id := range spec.TagIDs {
@@ -541,7 +583,7 @@ func (s *handler) association(w http.ResponseWriter, r *http.Request) {
 			}
 			res = append(res, o)
 		}
-		s.ok(w, res)
+		OK(w, res)
 	case "list-attached-tags-on-objects":
 		var res []tags.AttachedTags
 		for _, ref := range spec.ObjectIDs {
@@ -553,7 +595,7 @@ func (s *handler) association(w http.ResponseWriter, r *http.Request) {
 			}
 			res = append(res, o)
 		}
-		s.ok(w, res)
+		OK(w, res)
 	}
 }
 
@@ -578,16 +620,16 @@ func (s *handler) associationID(w http.ResponseWriter, r *http.Request) {
 	switch s.action(r) {
 	case "attach":
 		s.Association[id][*spec.ObjectID] = true
-		s.ok(w)
+		OK(w)
 	case "detach":
 		delete(s.Association[id], *spec.ObjectID)
-		s.ok(w)
+		OK(w)
 	case "list-attached-objects":
 		var ids []internal.AssociatedObject
 		for id := range s.Association[id] {
 			ids = append(ids, id)
 		}
-		s.ok(w, ids)
+		OK(w, ids)
 	}
 }
 
@@ -618,10 +660,12 @@ func (s *handler) library(w http.ResponseWriter, r *http.Request) {
 				}
 				ids = append(ids, l.ID)
 			}
-			s.ok(w, ids)
+			OK(w, ids)
 		case "":
 			id := uuid.New().String()
 			spec.Library.ID = id
+			spec.Library.CreationTime = types.NewTime(time.Now())
+			spec.Library.LastModifiedTime = types.NewTime(time.Now())
 			dir := libraryPath(&spec.Library, "")
 			if err := os.Mkdir(dir, 0750); err != nil {
 				s.error(w, err)
@@ -631,14 +675,14 @@ func (s *handler) library(w http.ResponseWriter, r *http.Request) {
 				Library: &spec.Library,
 				Item:    make(map[string]*item),
 			}
-			s.ok(w, id)
+			OK(w, id)
 		}
 	case http.MethodGet:
 		var ids []string
 		for id := range s.Library {
 			ids = append(ids, id)
 		}
-		s.ok(w, ids)
+		OK(w, ids)
 	}
 }
 
@@ -658,18 +702,29 @@ func (s *handler) libraryID(w http.ResponseWriter, r *http.Request) {
 			s.error(w, err)
 			return
 		}
+		for _, item := range l.Item {
+			s.deleteVM(item.Template)
+		}
 		delete(s.Library, id)
-		s.ok(w)
+		OK(w)
 	case http.MethodPatch:
 		var spec struct {
 			Library library.Library `json:"update_spec"`
 		}
 		if s.decode(r, w, &spec) {
 			l.Patch(&spec.Library)
-			s.ok(w)
+			OK(w)
+		}
+	case http.MethodPost:
+	case "sync":
+		if l.Type == "SUBSCRIBED" {
+			l.LastSyncTime = types.NewTime(time.Now())
+			OK(w)
+		} else {
+			http.NotFound(w, r)
 		}
 	case http.MethodGet:
-		s.ok(w, l)
+		OK(w, l)
 	}
 }
 
@@ -707,7 +762,7 @@ func (s *handler) libraryItem(w http.ResponseWriter, r *http.Request) {
 					ids = append(ids, i.ID)
 				}
 			}
-			s.ok(w, ids)
+			OK(w, ids)
 		case "create", "":
 			id := spec.Item.LibraryID
 			l, ok := s.Library[id]
@@ -718,14 +773,16 @@ func (s *handler) libraryItem(w http.ResponseWriter, r *http.Request) {
 			}
 			for _, item := range l.Item {
 				if item.Name == spec.Item.Name {
-					s.fail(w, "com.vmware.vapi.std.errors.already_exists")
+					BadRequest(w, "com.vmware.vapi.std.errors.already_exists")
 					return
 				}
 			}
 			id = uuid.New().String()
 			spec.Item.ID = id
+			spec.Item.CreationTime = types.NewTime(time.Now())
+			spec.Item.LastModifiedTime = types.NewTime(time.Now())
 			l.Item[id] = &item{Item: &spec.Item}
-			s.ok(w, id)
+			OK(w, id)
 		}
 	case http.MethodGet:
 		id := r.URL.Query().Get("library_id")
@@ -740,7 +797,7 @@ func (s *handler) libraryItem(w http.ResponseWriter, r *http.Request) {
 		for id := range l.Item {
 			ids = append(ids, id)
 		}
-		s.ok(w, ids)
+		OK(w, ids)
 	}
 }
 
@@ -772,18 +829,29 @@ func (s *handler) libraryItemID(w http.ResponseWriter, r *http.Request) {
 			s.error(w, err)
 			return
 		}
+		s.deleteVM(l.Item[item.ID].Template)
 		delete(l.Item, item.ID)
-		s.ok(w)
+		OK(w)
 	case http.MethodPatch:
 		var spec struct {
 			Item library.Item `json:"update_spec"`
 		}
 		if s.decode(r, w, &spec) {
 			item.Patch(&spec.Item)
-			s.ok(w)
+			OK(w)
+		}
+	case http.MethodPost:
+		switch s.action(r) {
+		case "sync":
+			if l.Type == "SUBSCRIBED" {
+				item.LastSyncTime = types.NewTime(time.Now())
+				OK(w)
+			} else {
+				http.NotFound(w, r)
+			}
 		}
 	case http.MethodGet:
-		s.ok(w, item)
+		OK(w, item)
 	}
 }
 
@@ -794,7 +862,7 @@ func (s *handler) libraryItemUpdateSession(w http.ResponseWriter, r *http.Reques
 		for id := range s.Update {
 			ids = append(ids, id)
 		}
-		s.ok(w, ids)
+		OK(w, ids)
 	case http.MethodPost:
 		var spec struct {
 			Session library.Session `json:"create_spec"`
@@ -824,7 +892,7 @@ func (s *handler) libraryItemUpdateSession(w http.ResponseWriter, r *http.Reques
 				Library: lib,
 				File:    make(map[string]*library.UpdateFile),
 			}
-			s.ok(w, session.ID)
+			OK(w, session.ID)
 		}
 	}
 }
@@ -850,7 +918,7 @@ func (s *handler) libraryItemUpdateSessionID(w http.ResponseWriter, r *http.Requ
 
 	switch r.Method {
 	case http.MethodGet:
-		s.ok(w, session)
+		OK(w, session)
 	case http.MethodPost:
 		switch s.action(r) {
 		case "cancel":
@@ -862,10 +930,10 @@ func (s *handler) libraryItemUpdateSessionID(w http.ResponseWriter, r *http.Requ
 		case "keep-alive":
 			session.ExpirationTime = types.NewTime(time.Now().Add(time.Hour))
 		}
-		s.ok(w)
+		OK(w)
 	case http.MethodDelete:
 		delete(s.Update, id)
-		s.ok(w)
+		OK(w)
 	}
 }
 
@@ -887,7 +955,7 @@ func (s *handler) libraryItemUpdateSessionFile(w http.ResponseWriter, r *http.Re
 	for _, f := range up.File {
 		files = append(files, f)
 	}
-	s.ok(w, files)
+	OK(w, files)
 }
 
 func (s *handler) pullSource(up update, info *library.UpdateFile) {
@@ -951,7 +1019,7 @@ func (s *handler) libraryItemUpdateSessionFileID(w http.ResponseWriter, r *http.
 				u := url.URL{
 					Scheme: s.URL.Scheme,
 					Host:   s.URL.Host,
-					Path:   path.Join(internal.Path, internal.LibraryItemFileData, id, info.Name),
+					Path:   path.Join(rest.Path, internal.LibraryItemFileData, id, info.Name),
 				}
 				info.UploadEndpoint = &library.TransferEndpoint{URI: u.String()}
 			case "PULL":
@@ -959,19 +1027,19 @@ func (s *handler) libraryItemUpdateSessionFileID(w http.ResponseWriter, r *http.
 				go s.pullSource(up, info)
 			}
 			up.File[id] = info
-			s.ok(w, info)
+			OK(w, info)
 		}
 	case "get":
-		s.ok(w, up.Session)
+		OK(w, up.Session)
 	case "list":
 		var ids []string
 		for id := range up.File {
 			ids = append(ids, id)
 		}
-		s.ok(w, ids)
+		OK(w, ids)
 	case "remove":
 		delete(s.Update, id)
-		s.ok(w)
+		OK(w)
 	case "validate":
 		// TODO
 	}
@@ -984,7 +1052,7 @@ func (s *handler) libraryItemDownloadSession(w http.ResponseWriter, r *http.Requ
 		for id := range s.Download {
 			ids = append(ids, id)
 		}
-		s.ok(w, ids)
+		OK(w, ids)
 	case http.MethodPost:
 		var spec struct {
 			Session library.Session `json:"create_spec"`
@@ -1028,7 +1096,7 @@ func (s *handler) libraryItemDownloadSession(w http.ResponseWriter, r *http.Requ
 					Status: "UNPREPARED",
 				}
 			}
-			s.ok(w, session.ID)
+			OK(w, session.ID)
 		}
 	}
 }
@@ -1045,7 +1113,7 @@ func (s *handler) libraryItemDownloadSessionID(w http.ResponseWriter, r *http.Re
 	session := up.Session
 	switch r.Method {
 	case http.MethodGet:
-		s.ok(w, session)
+		OK(w, session)
 	case http.MethodPost:
 		switch s.action(r) {
 		case "cancel", "complete", "fail":
@@ -1053,10 +1121,10 @@ func (s *handler) libraryItemDownloadSessionID(w http.ResponseWriter, r *http.Re
 		case "keep-alive":
 			session.ExpirationTime = types.NewTime(time.Now().Add(time.Hour))
 		}
-		s.ok(w)
+		OK(w)
 	case http.MethodDelete:
 		delete(s.Download, id)
-		s.ok(w)
+		OK(w)
 	}
 }
 
@@ -1078,7 +1146,7 @@ func (s *handler) libraryItemDownloadSessionFile(w http.ResponseWriter, r *http.
 	for _, f := range dl.File {
 		files = append(files, f)
 	}
-	s.ok(w, files)
+	OK(w, files)
 }
 
 func (s *handler) libraryItemDownloadSessionFileID(w http.ResponseWriter, r *http.Request) {
@@ -1105,7 +1173,7 @@ func (s *handler) libraryItemDownloadSessionFileID(w http.ResponseWriter, r *htt
 			u := url.URL{
 				Scheme: s.URL.Scheme,
 				Host:   s.URL.Host,
-				Path:   path.Join(internal.Path, internal.LibraryItemFileData, id, spec.File),
+				Path:   path.Join(rest.Path, internal.LibraryItemFileData, id, spec.File),
 			}
 			info := &library.DownloadFile{
 				Name:             spec.File,
@@ -1116,11 +1184,11 @@ func (s *handler) libraryItemDownloadSessionFileID(w http.ResponseWriter, r *htt
 				},
 			}
 			dl.File[spec.File] = info
-			s.ok(w, info)
+			OK(w, info)
 		}
 	case "get":
 		if s.decode(r, w, &spec) {
-			s.ok(w, dl.File[spec.File])
+			OK(w, dl.File[spec.File])
 		}
 	}
 }
@@ -1250,7 +1318,7 @@ func (s *handler) libraryItemFile(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("library_item_id")
 	for _, l := range s.Library {
 		if i, ok := l.Item[id]; ok {
-			s.ok(w, i.File)
+			OK(w, i.File)
 			return
 		}
 	}
@@ -1273,7 +1341,7 @@ func (s *handler) libraryItemFileID(w http.ResponseWriter, r *http.Request) {
 		if i, ok := l.Item[id]; ok {
 			for _, f := range i.File {
 				if f.Name == spec.Name {
-					s.ok(w, f)
+					OK(w, f)
 					return
 				}
 			}
@@ -1291,7 +1359,7 @@ func (i *item) ovf() string {
 	return ""
 }
 
-func (s *handler) libraryDeploy(lib *library.Library, item *item, deploy vcenter.Deploy) (*nfc.LeaseInfo, error) {
+func (s *handler) libraryDeploy(ctx context.Context, c *vim25.Client, lib *library.Library, item *item, deploy vcenter.Deploy) (*nfc.LeaseInfo, error) {
 	name := item.ovf()
 	desc, err := ioutil.ReadFile(filepath.Join(libraryPath(lib, item.ID), name))
 	if err != nil {
@@ -1307,16 +1375,7 @@ func (s *handler) libraryDeploy(lib *library.Library, item *item, deploy vcenter
 		host = &types.ManagedObjectReference{Type: "HostSystem", Value: deploy.Target.HostID}
 	}
 
-	ctx := context.Background()
-	c, err := govmomi.NewClient(ctx, &s.URL, true)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = c.Logout(ctx)
-	}()
-
-	v, err := view.NewManager(c.Client).CreateContainerView(ctx, c.ServiceContent.RootFolder, nil, true)
+	v, err := view.NewManager(c).CreateContainerView(ctx, c.ServiceContent.RootFolder, nil, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1336,6 +1395,16 @@ func (s *handler) libraryDeploy(lib *library.Library, item *item, deploy vcenter
 				break
 			}
 		}
+	}
+
+	if ds.Value == "" {
+		// Datastore is optional in the deploy spec, but not in OvfManager.CreateImportSpec
+		refs, err = v.Find(ctx, []string{"Datastore"}, nil)
+		if err != nil {
+			return nil, err
+		}
+		// TODO: consider StorageProfileID
+		ds = refs[0]
 	}
 
 	cisp := types.OvfCreateImportSpecParams{
@@ -1358,7 +1427,7 @@ func (s *handler) libraryDeploy(lib *library.Library, item *item, deploy vcenter
 		}
 	}
 
-	m := ovf.NewManager(c.Client)
+	m := ovf.NewManager(c)
 	spec, err := m.CreateImportSpec(ctx, string(desc), pool, ds, cisp)
 	if err != nil {
 		return nil, err
@@ -1378,7 +1447,7 @@ func (s *handler) libraryDeploy(lib *library.Library, item *item, deploy vcenter
 		return nil, err
 	}
 
-	lease := nfc.NewLease(c.Client, res.Returnval)
+	lease := nfc.NewLease(c, res.Returnval)
 	info, err := lease.Wait(ctx, spec.FileItem)
 	if err != nil {
 		return nil, err
@@ -1387,7 +1456,50 @@ func (s *handler) libraryDeploy(lib *library.Library, item *item, deploy vcenter
 	return info, lease.Complete(ctx)
 }
 
-func (s *handler) libraryItemDeployID(w http.ResponseWriter, r *http.Request) {
+func (s *handler) libraryItemOVF(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req vcenter.OVF
+	if !s.decode(r, w, &req) {
+		return
+	}
+
+	switch {
+	case req.Target.LibraryItemID != "":
+	case req.Target.LibraryID != "":
+		l, ok := s.Library[req.Target.LibraryID]
+		if !ok {
+			http.NotFound(w, r)
+		}
+
+		id := uuid.New().String()
+		l.Item[id] = &item{
+			Item: &library.Item{
+				ID:               id,
+				LibraryID:        l.Library.ID,
+				Name:             req.Spec.Name,
+				Description:      req.Spec.Description,
+				Type:             library.ItemTypeOVF,
+				CreationTime:     types.NewTime(time.Now()),
+				LastModifiedTime: types.NewTime(time.Now()),
+			},
+		}
+
+		res := vcenter.CreateResult{
+			Succeeded: true,
+			ID:        id,
+		}
+		OK(w, res)
+	default:
+		BadRequest(w, "com.vmware.vapi.std.errors.invalid_argument")
+		return
+	}
+}
+
+func (s *handler) libraryItemOVFID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -1420,12 +1532,17 @@ func (s *handler) libraryItemDeployID(w http.ResponseWriter, r *http.Request) {
 	switch s.action(r) {
 	case "deploy":
 		var d vcenter.Deployment
-		info, err := s.libraryDeploy(lib, item, spec.Deploy)
-		if err == nil {
+		err := s.withClient(func(ctx context.Context, c *vim25.Client) error {
+			info, err := s.libraryDeploy(ctx, c, lib, item, spec.Deploy)
+			if err != nil {
+				return err
+			}
 			id := vcenter.ResourceID(info.Entity)
 			d.Succeeded = true
 			d.ResourceID = &id
-		} else {
+			return nil
+		})
+		if err != nil {
 			d.Error = &vcenter.DeploymentError{
 				Errors: []vcenter.OVFError{{
 					Category: "SERVER",
@@ -1440,12 +1557,245 @@ func (s *handler) libraryItemDeployID(w http.ResponseWriter, r *http.Request) {
 				}},
 			}
 		}
-		s.ok(w, d)
+		OK(w, d)
 	case "filter":
 		res := vcenter.FilterResponse{
 			Name: item.Name,
 		}
-		s.ok(w, res)
+		OK(w, res)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *handler) deleteVM(ref *types.ManagedObjectReference) {
+	if ref == nil {
+		return
+	}
+	_ = s.withClient(func(ctx context.Context, c *vim25.Client) error {
+		_, _ = object.NewVirtualMachine(c, *ref).Destroy(ctx)
+		return nil
+	})
+}
+
+func (s *handler) cloneVM(source string, name string, p *vcenter.Placement, storage *vcenter.DiskStorage) (*types.ManagedObjectReference, error) {
+	var folder, pool, host, ds *types.ManagedObjectReference
+	if p.Folder != "" {
+		folder = &types.ManagedObjectReference{Type: "Folder", Value: p.Folder}
+	}
+	if p.ResourcePool != "" {
+		pool = &types.ManagedObjectReference{Type: "ResourcePool", Value: p.ResourcePool}
+	}
+	if p.Host != "" {
+		host = &types.ManagedObjectReference{Type: "HostSystem", Value: p.Host}
+	}
+	if storage != nil {
+		if storage.Datastore != "" {
+			ds = &types.ManagedObjectReference{Type: "Datastore", Value: storage.Datastore}
+		}
+	}
+
+	spec := types.VirtualMachineCloneSpec{
+		Template: true,
+		Location: types.VirtualMachineRelocateSpec{
+			Folder:    folder,
+			Pool:      pool,
+			Host:      host,
+			Datastore: ds,
+		},
+	}
+
+	var ref *types.ManagedObjectReference
+
+	return ref, s.withClient(func(ctx context.Context, c *vim25.Client) error {
+		vm := object.NewVirtualMachine(c, types.ManagedObjectReference{Type: "VirtualMachine", Value: source})
+
+		task, err := vm.Clone(ctx, object.NewFolder(c, *folder), name, spec)
+		if err != nil {
+			return err
+		}
+		res, err := task.WaitForResult(ctx, nil)
+		if err != nil {
+			return err
+		}
+		ref = types.NewReference(res.Result.(types.ManagedObjectReference))
+		return nil
+	})
+}
+
+func (s *handler) templateCreate(l content, deploy vcenter.Template) error {
+	ref, err := s.cloneVM(deploy.SourceVM, deploy.Name, deploy.Placement, nil)
+	if err != nil {
+		return err
+	}
+
+	id := uuid.New().String()
+	l.Item[id] = &item{
+		Item: &library.Item{
+			ID:               id,
+			LibraryID:        l.Library.ID,
+			Name:             deploy.Name,
+			Type:             library.ItemTypeVMTX,
+			CreationTime:     types.NewTime(time.Now()),
+			LastModifiedTime: types.NewTime(time.Now()),
+		},
+		Template: ref,
+	}
+
+	return nil
+}
+
+func (s *handler) libraryItemCreateTemplate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var spec struct {
+		vcenter.Template `json:"spec"`
+	}
+	if !s.decode(r, w, &spec) {
+		return
+	}
+
+	l, ok := s.Library[spec.Library]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	ref, err := s.cloneVM(spec.SourceVM, spec.Name, spec.Placement, nil)
+	if err != nil {
+		BadRequest(w, err.Error())
+		return
+	}
+
+	id := uuid.New().String()
+	l.Item[id] = &item{
+		Item: &library.Item{
+			ID:               id,
+			LibraryID:        l.Library.ID,
+			Name:             spec.Name,
+			Type:             library.ItemTypeVMTX,
+			CreationTime:     types.NewTime(time.Now()),
+			LastModifiedTime: types.NewTime(time.Now()),
+		},
+		Template: ref,
+	}
+
+	OK(w, id)
+}
+
+func (s *handler) libraryItemTemplateID(w http.ResponseWriter, r *http.Request) {
+	// Go's ServeMux doesn't support wildcard matching, hacking around that for now to support
+	// CheckOuts, e.g. "/vcenter/vm-template/library-items/{item}/check-outs/{vm}?action=check-in"
+	p := strings.TrimPrefix(r.URL.Path, rest.Path+internal.VCenterVMTXLibraryItem+"/")
+	route := strings.Split(p, "/")
+	if len(route) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+
+	id := route[0]
+	ok := false
+
+	var item *item
+	for _, l := range s.Library {
+		item, ok = l.Item[id]
+		if ok {
+			break
+		}
+	}
+	if !ok {
+		log.Printf("library item not found: %q", id)
+		http.NotFound(w, r)
+		return
+	}
+
+	if item.Type != library.ItemTypeVMTX {
+		BadRequest(w, "com.vmware.vapi.std.errors.invalid_argument")
+		return
+	}
+
+	if len(route) > 1 {
+		switch route[1] {
+		case "check-outs":
+			s.libraryItemCheckOuts(item, w, r)
+			return
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}
+
+	var spec struct {
+		vcenter.DeployTemplate `json:"spec"`
+	}
+	if !s.decode(r, w, &spec) {
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		// TODO: place holder as the API supports this method,
+		// but not aware of a use case for the data yet.
+		t := &vcenter.TemplateInfo{}
+		OK(w, t)
+		return
+	}
+
+	switch r.URL.Query().Get("action") {
+	case "deploy":
+		p := spec.Placement
+		if p == nil {
+			BadRequest(w, "com.vmware.vapi.std.errors.invalid_argument")
+			return
+		}
+		if p.Cluster == "" && p.Host == "" && p.ResourcePool == "" {
+			BadRequest(w, "com.vmware.vapi.std.errors.invalid_argument")
+			return
+		}
+
+		ref, err := s.cloneVM(item.Template.Value, spec.Name, p, spec.DiskStorage)
+		if err != nil {
+			BadRequest(w, err.Error())
+			return
+		}
+		OK(w, ref.Value)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *handler) libraryItemCheckOuts(item *item, w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Query().Get("action") {
+	case "check-out":
+		var spec struct {
+			*vcenter.CheckOut `json:"spec"`
+		}
+		if !s.decode(r, w, &spec) {
+			return
+		}
+
+		ref, err := s.cloneVM(item.Template.Value, spec.Name, spec.Placement, nil)
+		if err != nil {
+			BadRequest(w, err.Error())
+			return
+		}
+		OK(w, ref.Value)
+	case "check-in":
+		// TODO: increment ContentVersion
+		OK(w, "0")
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *handler) vmID(w http.ResponseWriter, r *http.Request) {
+	id := path.Base(r.URL.Path)
+
+	switch r.Method {
+	case http.MethodDelete:
+		s.deleteVM(&types.ManagedObjectReference{Type: "VirtualMachine", Value: id})
 	default:
 		http.NotFound(w, r)
 	}

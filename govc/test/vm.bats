@@ -57,18 +57,28 @@ load test_helper
 }
 
 @test "vm.create" {
-  esx_env
+  unset GOVC_DATASTORE
+  vcsim_start
 
-  id=$(new_ttylinux_vm)
-
-  run govc vm.power -on $id
+  run govc cluster.create empty-cluster
   assert_success
 
-  result=$(govc device.ls -vm $vm | grep disk- | wc -l)
-  [ $result -eq 0 ]
+  id=$(new_id)
+  run govc vm.create -on=false "$id"
+  assert_failure # -pool must be specified
 
-  result=$(govc device.ls -vm $vm | grep cdrom- | wc -l)
-  [ $result -eq 0 ]
+  run govc vm.create -pool DC0_C0/Resources "$id"
+  assert_success
+
+  id=$(new_id)
+  run govc vm.create -cluster enoent "$id"
+  assert_failure # cluster does not exist
+
+  run govc vm.create -cluster empty-cluster "$id"
+  assert_failure # cluster has no hosts
+
+  run govc vm.create -cluster DC0_C0 "$id"
+  assert_success
 }
 
 @test "vm.change" {
@@ -130,6 +140,22 @@ load test_helper
 
   run govc vm.info $nid
   [ ${#lines[@]} -gt 0 ]
+}
+
+@test "vm.change vcsim" {
+  vcsim_env
+
+  run govc vm.change -vm DC0_H0_VM0 -latency fail
+  assert_failure
+
+  run govc object.collect -s vm/DC0_H0_VM0 config.latencySensitivity.level
+  assert_success normal
+
+  run govc vm.change -vm DC0_H0_VM0 -latency high
+  assert_success
+
+  run govc object.collect -s vm/DC0_H0_VM0 config.latencySensitivity.level
+  assert_success high
 }
 
 @test "vm.power" {
@@ -283,7 +309,7 @@ load test_helper
     [ ${#lines[@]} -eq 0 ]
 
     # If VM is not found (using -json flag): Valid json output, exit code==0
-    run govc vm.info -json $id
+    run env GOVC_INDENT=false govc vm.info -json $id
     assert_success
     assert_line "{\"VirtualMachines\":null}"
 
@@ -648,6 +674,13 @@ load test_helper
 
   run govc vm.clone -vm "$vm" -snapshot X "$clone"
   assert_success
+
+  clone=$(new_id)
+  run govc vm.clone -cluster enoent -vm "$vm" "$clone"
+  assert_failure
+
+  run govc vm.clone -cluster DC0_C0 -vm "$vm" "$clone"
+  assert_success
 }
 
 @test "vm.clone change resources" {
@@ -859,4 +892,71 @@ load test_helper
 
   run govc vm.option.info -vm DC0_H0_VM0
   assert_success
+}
+
+@test "vm.customize" {
+  vcsim_env
+
+  run govc vm.customize -vm DC0_H0_VM0 -ip 10.0.0.42 -netmask 255.255.0.0 vcsim-linux-static
+  assert_failure # power must be off
+
+  run govc vm.power -off DC0_H0_VM0
+  assert_success
+
+  run govc vm.customize -vm DC0_H0_VM0 -ip 10.0.0.42 -netmask 255.255.0.0 vcsim-linux-static
+  assert_success
+
+  run govc vm.customize -vm DC0_H0_VM0 -ip 10.0.0.42 -netmask 255.255.0.0 vcsim-linux-static
+  assert_failure # pending customization
+
+  run govc vm.power -on DC0_H0_VM0
+  assert_success
+
+  run govc object.collect -s vm/DC0_H0_VM0 guest.ipAddress
+  assert_success 10.0.0.42
+
+  run govc object.collect -s vm/DC0_H0_VM0 guest.hostName
+  assert_success vcsim-1
+
+  run govc vm.power -off DC0_H0_VM0
+  assert_success
+
+  run govc vm.customize -vm DC0_H0_VM0 -ip 10.0.0.43 -netmask 255.255.0.0 -domain HOME -tz D -name windoze vcsim-windows-static
+  assert_success
+
+  run govc vm.power -on DC0_H0_VM0
+  assert_success
+
+  run govc object.collect -s vm/DC0_H0_VM0 guest.ipAddress
+  assert_success 10.0.0.43
+
+  run govc object.collect -s vm/DC0_H0_VM0 guest.hostName
+  assert_success windoze
+
+  run govc vm.power -off DC0_H0_VM0
+  assert_success
+
+  run govc vm.customize -vm DC0_H0_VM0 -ip 10.0.0.44 -netmask 255.255.0.0 -type Windows
+  assert_success
+
+  run govc vm.power -on DC0_H0_VM0
+  assert_success
+
+  run govc object.collect -s vm/DC0_H0_VM0 guest.ipAddress
+  assert_success 10.0.0.44
+
+  run govc vm.power -off DC0_H0_VM0
+  assert_success
+
+  run govc vm.customize -vm DC0_H0_VM0 -type Linux
+  assert_failure # no -ip specified
+
+  run govc vm.customize -vm DC0_H0_VM0 -ip 10.0.0.45 -netmask 255.255.0.0 -type Linux
+  assert_success
+
+  run govc vm.power -on DC0_H0_VM0
+  assert_success
+
+  run govc object.collect -s vm/DC0_H0_VM0 guest.ipAddress
+  assert_success 10.0.0.45
 }

@@ -33,15 +33,17 @@ import (
 	"syscall"
 
 	"github.com/google/uuid"
-	lookup "github.com/vmware/govmomi/lookup/simulator"
-	pbm "github.com/vmware/govmomi/pbm/simulator"
 	"github.com/vmware/govmomi/session"
 	"github.com/vmware/govmomi/simulator"
 	"github.com/vmware/govmomi/simulator/esx"
-	"github.com/vmware/govmomi/simulator/vpx"
-	sts "github.com/vmware/govmomi/sts/simulator"
-	vapi "github.com/vmware/govmomi/vapi/simulator"
 	"github.com/vmware/govmomi/vim25/types"
+
+	// Register vcsim optional endpoints
+	_ "github.com/vmware/govmomi/lookup/simulator"
+	_ "github.com/vmware/govmomi/pbm/simulator"
+	_ "github.com/vmware/govmomi/sts/simulator"
+	_ "github.com/vmware/govmomi/vapi/cluster/simulator"
+	_ "github.com/vmware/govmomi/vapi/simulator"
 )
 
 func main() {
@@ -57,6 +59,8 @@ func main() {
 	flag.IntVar(&model.App, "app", model.App, "Number of virtual apps per compute resource")
 	flag.IntVar(&model.Pod, "pod", model.Pod, "Number of storage pods per datacenter")
 	flag.IntVar(&model.Portgroup, "pg", model.Portgroup, "Number of port groups")
+	flag.IntVar(&model.PortgroupNSX, "pg-nsx", model.PortgroupNSX, "Number of NSX backed port groups")
+	flag.IntVar(&model.OpaqueNetwork, "nsx", model.OpaqueNetwork, "Number of NSX backed opaque networks")
 	flag.IntVar(&model.Folder, "folder", model.Folder, "Number of folders")
 	flag.BoolVar(&model.Autostart, "autostart", model.Autostart, "Autostart model created VMs")
 	v := &model.ServiceContent.About.ApiVersion
@@ -71,14 +75,26 @@ func main() {
 	user := flag.String("username", "", "Login username for vcsim (any username allowed by default)")
 	pass := flag.String("password", "", "Login password for vcsim (any password allowed by default)")
 	tunnel := flag.Int("tunnel", -1, "SDK tunnel port")
-	flag.BoolVar(&simulator.Trace, "trace", simulator.Trace, "Trace SOAP to stderr")
+	flag.BoolVar(&simulator.Trace, "trace", simulator.Trace, "Trace SOAP to -trace-file")
+	trace := flag.String("trace-file", "", "Trace output file (defaults to stderr)")
 	stdinExit := flag.Bool("stdinexit", false, "Press any key to exit")
+	dir := flag.String("load", "", "Load model from directory")
 
 	flag.IntVar(&model.DelayConfig.Delay, "delay", model.DelayConfig.Delay, "Method response delay across all methods")
 	methodDelayP := flag.String("method-delay", "", "Delay per method on the form 'method1:delay1,method2:delay2...'")
 	flag.Float64Var(&model.DelayConfig.DelayJitter, "delay-jitter", model.DelayConfig.DelayJitter, "Delay jitter coefficient of variation (tip: 0.5 is a good starting value)")
 
 	flag.Parse()
+
+	if *trace != "" {
+		var err error
+		simulator.TraceFile, err = os.Create(*trace)
+		if err != nil {
+			log.Fatal(err)
+		}
+		simulator.Trace = true
+	}
+
 	methodDelay := *methodDelayP
 	u := &url.URL{Host: *listen}
 	if *user != "" {
@@ -142,11 +158,16 @@ func main() {
 
 	esx.HostSystem.Summary.Hardware.Vendor += tag
 
-	err = model.Create()
+	if *dir == "" {
+		err = model.Create()
+	} else {
+		err = model.Load(*dir)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	model.Service.RegisterEndpoints = true
 	model.Service.Listen = u
 	if *isTLS {
 		model.Service.TLS = new(tls.Config)
@@ -183,22 +204,6 @@ func main() {
 		}
 	}
 
-	if !*isESX {
-		// STS simulator
-		path, handler := sts.New(s.URL, vpx.Setting)
-		model.Service.Handle(path, handler)
-
-		// vAPI simulator
-		path, handler = vapi.New(s.URL, vpx.Setting)
-		model.Service.Handle(path, handler)
-
-		// Lookup Service simulator
-		model.Service.RegisterSDK(lookup.New())
-
-		// PBM simulator
-		model.Service.RegisterSDK(pbm.New())
-	}
-
 	fmt.Fprintf(out, "export GOVC_URL=%s GOVC_SIM_PID=%d\n", s.URL, os.Getpid())
 	if out != os.Stdout {
 		err = out.Close()
@@ -220,6 +225,10 @@ func main() {
 	<-sig
 
 	model.Remove()
+
+	if *trace != "" {
+		_ = simulator.TraceFile.Close()
+	}
 }
 
 func updateHostTemplate(ip string) error {
